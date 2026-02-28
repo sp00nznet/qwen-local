@@ -128,6 +128,10 @@ export async function startCLI() {
     }
   });
 
+  // Prevent default process exit on Ctrl+C — the rl.on('SIGINT') handler above does the real work.
+  // Without this, Windows sends CTRL_C_EVENT → Node converts to SIGINT → default behavior is exit.
+  process.on('SIGINT', () => {});
+
   rl.on('close', () => {
     process.exit(0);
   });
