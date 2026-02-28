@@ -11,8 +11,12 @@ import { getAllSkills, getSkill, saveSkill, deleteSkill, expandSkillPrompt, matc
 import { loadAllMemory, clearGlobalMemory, clearProjectMemory, getMemoryStats } from './memory.js';
 import { colors, formatToolCall, truncate, contextBar, formatDuration } from './utils.js';
 
-// Module-level flag so SIGINT handler knows if agent is busy
+// Module-level state so process SIGINT handler can abort in-flight requests
 let _isBusy = false;
+let _agent = null;
+let _rl = null;
+let _promptFn = null;
+let _aborted = false; // flag checked by handleUserInput to know it was interrupted
 
 export async function startCLI() {
   const cwd = process.cwd();
@@ -28,6 +32,7 @@ export async function startCLI() {
   console.log(colors.dim('  Type /help for commands, /exit to quit\n'));
 
   const agent = createAgent();
+  _agent = agent;
   let multilineBuffer = null;
   let skillDraftState = null; // for interactive skill creation
 
@@ -36,6 +41,7 @@ export async function startCLI() {
     output: process.stdout,
     terminal: true,
   });
+  _rl = rl;
 
   // Helper to ask a question and get a response
   function ask(question) {
@@ -97,21 +103,24 @@ export async function startCLI() {
     });
   };
 
-  rl.on('SIGINT', () => {
+  // Use process-level SIGINT so it works even when readline is paused
+  // (readline's own SIGINT handler doesn't fire when rl.pause() is active)
+  process.on('SIGINT', () => {
     if (_isBusy) {
-      // Abort the in-flight request and return to prompt
-      agent.abort();
+      // Abort the in-flight request — handleUserInput checks _aborted to bail out
+      _agent.abort();
+      _aborted = true;
       _isBusy = false;
       console.log(colors.warning('\n\n  Interrupted.\n'));
-      rl.resume();
-      prompt();
+      _rl.resume();
+      _promptFn();
     } else if (multilineBuffer !== null) {
       multilineBuffer = null;
       console.log(colors.dim('\n  (multiline cancelled)'));
-      prompt();
+      _promptFn();
     } else {
       console.log(colors.dim('\n\n  Use /exit to quit.\n'));
-      prompt();
+      _promptFn();
     }
   });
 
@@ -119,12 +128,14 @@ export async function startCLI() {
     process.exit(0);
   });
 
+  _promptFn = prompt;
   prompt();
 }
 
 async function handleUserInput(input, rl, agent) {
   rl.pause();
   _isBusy = true;
+  _aborted = false;
 
   let spinner = null;
   let thinkingSpinner = null;
@@ -151,6 +162,7 @@ async function handleUserInput(input, rl, agent) {
   try {
     await agent.chat(input, {
       onText: (text) => {
+        if (_aborted) return;
         if (thinkingSpinner) {
           thinkingSpinner.stop();
           thinkingSpinner = null;
@@ -167,6 +179,7 @@ async function handleUserInput(input, rl, agent) {
         process.stdout.write(formatted);
       },
       onToolCall: (name, args) => {
+        if (_aborted) return;
         if (thinkingSpinner) {
           thinkingSpinner.stop();
           thinkingSpinner = null;
@@ -183,6 +196,7 @@ async function handleUserInput(input, rl, agent) {
         }).start();
       },
       onToolResult: (name, result) => {
+        if (_aborted) return;
         if (spinner) {
           spinner.succeed(colors.dim(`${name} done`));
           spinner = null;
@@ -191,14 +205,17 @@ async function handleUserInput(input, rl, agent) {
         console.log(colors.toolResult('  ' + truncate(preview, 300).replace(/\n/g, '\n  ')));
       },
       onError: (err) => {
+        if (_aborted) return;
         if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
         if (spinner) { spinner.fail('Error'); spinner = null; }
         console.log('\n  ' + colors.error(err));
       },
       onCompact: (before, after) => {
+        if (_aborted) return;
         console.log(colors.compact(`\n  [Context compacted: ${before} messages → ${after} messages]`));
       },
       onThinking: (isThinking) => {
+        if (_aborted) return;
         if (isThinking && !thinkingSpinner) {
           thinkingSpinner = ora({
             text: colors.dim('Thinking...'),
@@ -212,13 +229,22 @@ async function handleUserInput(input, rl, agent) {
     });
   } catch (err) {
     if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
-    if (spinner) spinner.fail('Error');
-    console.log('\n  ' + colors.error(`Unexpected error: ${err.message}`));
+    if (spinner) { spinner.fail('Error'); spinner = null; }
+    if (!_aborted) {
+      console.log('\n  ' + colors.error(`Unexpected error: ${err.message}`));
+    }
   }
 
-  // Always clean up the timer
+  // Always clean up the timer and spinners
   clearInterval(thinkingInterval);
   if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
+  if (spinner) { spinner.stop(); spinner = null; }
+
+  // If aborted by Ctrl+C, the SIGINT handler already resumed rl and called prompt
+  if (_aborted) {
+    _aborted = false;
+    return;
+  }
 
   if (hasOutput) {
     process.stdout.write('\n');
