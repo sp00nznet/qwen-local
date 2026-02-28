@@ -18,8 +18,16 @@ let _aborted = false;
 let _cancelResolve = null; // resolves the cancel promise to win the race
 let _abortController = null; // aborts the fetch to Ollama
 
+// On Windows, Ctrl+C generates BOTH:
+// 1. Byte 0x03 on stdin (handled by readline → rl.on('SIGINT'))
+// 2. CTRL_C_EVENT via SetConsoleCtrlHandler (→ process 'SIGINT')
+// Without a process-level handler, #2 kills the process even though #1 was handled.
+process.on('SIGINT', () => {
+  // Intentionally empty — prevents Windows from killing the process.
+  // The actual interrupt logic lives in rl.on('SIGINT') inside startCLI().
+});
+
 // Safety net: catch any stray promise rejections from abandoned streams.
-// After Ctrl+C abort, the background fetch/stream may error — just swallow it.
 process.on('unhandledRejection', () => {});
 process.on('uncaughtException', (err) => {
   // Only crash on real errors, not stream cleanup noise
@@ -64,8 +72,14 @@ export async function startCLI() {
   // When readline has terminal: true, it intercepts Ctrl+C before process-level
   // handlers fire. Registering on rl prevents readline from closing the interface
   // and prevents the process from exiting — we handle it ourselves.
+  let _interruptedAt = 0;
   rl.on('SIGINT', () => {
+    // Debounce: ignore SIGINTs within 1s of an interrupt to prevent double-fire
+    // (Windows can deliver multiple signals from a single Ctrl+C press)
+    if (_interruptedAt && Date.now() - _interruptedAt < 1000) return;
+
     if (_isBusy) {
+      _interruptedAt = Date.now();
       // Interrupt the current operation
       _aborted = true;
       _isBusy = false;
