@@ -164,11 +164,11 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
   let firstToken = true;
 
   while (true) {
-    // Check cancelled before each read
+    // Check cancelled before each read — just return, don't cancel the reader.
+    // reader.cancel() causes unhandled promise rejections on Windows that crash Node.
+    // The stream will drain naturally when Ollama finishes generating.
     if (isCancelled()) {
       if (onThinking) onThinking(false);
-      // Try to cancel the reader to free resources (but don't crash if it fails)
-      try { reader.cancel(); } catch {}
       return null;
     }
 
@@ -191,7 +191,6 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
     for (const line of lines) {
       if (isCancelled()) {
         if (onThinking) onThinking(false);
-        try { reader.cancel(); } catch {}
         return null;
       }
 

@@ -17,6 +17,17 @@ let _agent = null;
 let _aborted = false;
 let _cancelResolve = null; // resolves the cancel promise to win the race
 
+// Safety net: catch any stray promise rejections from abandoned streams.
+// After ESC, the background fetch/stream may error when it finishes — just swallow it.
+process.on('unhandledRejection', () => {});
+process.on('uncaughtException', (err) => {
+  // Only crash on real errors, not stream cleanup noise
+  if (err.code === 'ERR_USE_AFTER_CLOSE' || err.name === 'AbortError' ||
+      err.message?.includes('cancel') || err.message?.includes('abort')) return;
+  console.error('\n  Fatal error:', err.message);
+  process.exit(1);
+});
+
 // Rotating verbs for the thinking spinner
 const THINKING_VERBS = [
   'Thinking', 'Reasoning', 'Analyzing', 'Considering', 'Processing',
