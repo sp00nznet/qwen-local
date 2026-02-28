@@ -28,7 +28,7 @@ export function createAgent() {
     }
   }
 
-  async function chat(userMessage, { onText, onToolCall, onToolResult, onError, onCompact, onThinking, onToken }) {
+  async function chat(userMessage, { onText, onToolCall, onToolResult, onError, onCompact, onThinking, onToken, signal }) {
     initSystem();
     _cancelled = false;
     messages.push({ role: 'user', content: userMessage });
@@ -49,7 +49,7 @@ export function createAgent() {
 
     while (loopCount < maxLoops && !_cancelled) {
       loopCount++;
-      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken }, () => _cancelled);
+      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken, signal }, () => _cancelled);
       if (!assistantMessage || _cancelled) return;
 
       messages.push(assistantMessage);
@@ -125,7 +125,7 @@ export function createAgent() {
   return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats, cancel };
 }
 
-async function callOllama(url, model, messages, { onText, onError, onThinking, onToken }, isCancelled) {
+async function callOllama(url, model, messages, { onText, onError, onThinking, onToken, signal }, isCancelled) {
   const body = {
     model,
     messages,
@@ -141,9 +141,11 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     });
   } catch (err) {
     if (onThinking) onThinking(false);
+    if (err.name === 'AbortError') return null; // Clean abort via Ctrl+C
     onError(`Failed to connect to Ollama at ${url}. Is Ollama running?\n${err.message}`);
     return null;
   }

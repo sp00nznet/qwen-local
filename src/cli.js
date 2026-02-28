@@ -11,14 +11,15 @@ import { getAllSkills, getSkill, saveSkill, deleteSkill, expandSkillPrompt, matc
 import { loadAllMemory, clearGlobalMemory, clearProjectMemory, getMemoryStats } from './memory.js';
 import { colors, formatToolCall, truncate, contextBar, formatDuration } from './utils.js';
 
-// Module-level state for ESC interrupt handling
+// Module-level state for interrupt handling
 let _isBusy = false;
 let _agent = null;
 let _aborted = false;
 let _cancelResolve = null; // resolves the cancel promise to win the race
+let _abortController = null; // aborts the fetch to Ollama
 
 // Safety net: catch any stray promise rejections from abandoned streams.
-// After ESC, the background fetch/stream may error when it finishes — just swallow it.
+// After Ctrl+C abort, the background fetch/stream may error — just swallow it.
 process.on('unhandledRejection', () => {});
 process.on('uncaughtException', (err) => {
   // Only crash on real errors, not stream cleanup noise
@@ -59,20 +60,22 @@ export async function startCLI() {
     terminal: true,
   });
 
-  // Listen for ESC key to interrupt processing.
-  // We listen for raw bytes on stdin instead of keypress events because readline
-  // buffers ESC (0x1b) waiting for escape sequences (arrow keys etc.) and may
-  // never emit a keypress event for ESC alone.
-  // ESC = single byte 0x1b. Escape sequences are multi-byte (e.g. 0x1b 0x5b 0x41 = arrow up).
-  process.stdin.on('data', (data) => {
-    if (data.length === 1 && data[0] === 0x1b && _isBusy) {
+  // Ctrl+C interrupt: use rl.on('SIGINT') — NOT process.on('SIGINT').
+  // When readline has terminal: true, it intercepts Ctrl+C before process-level
+  // handlers fire. Registering on rl prevents readline from closing the interface
+  // and prevents the process from exiting — we handle it ourselves.
+  rl.on('SIGINT', () => {
+    if (_isBusy) {
+      // Interrupt the current operation
       _aborted = true;
       _isBusy = false;
-      _agent.cancel(); // sets flag so callbacks become no-ops
-      if (_cancelResolve) {
-        _cancelResolve(); // resolves the cancel promise, wins the race
-        _cancelResolve = null;
-      }
+      _agent.cancel();
+      if (_abortController) _abortController.abort(); // kills the fetch → stops Ollama
+      if (_cancelResolve) { _cancelResolve(); _cancelResolve = null; }
+    } else {
+      // Not busy — exit gracefully
+      console.log(colors.dim('\n  Goodbye!\n'));
+      process.exit(0);
     }
   });
 
@@ -139,8 +142,9 @@ export async function startCLI() {
     });
   };
 
-  // Ctrl+C just exits the process (natural Windows behavior).
-  // Use ESC to soft-interrupt during processing.
+  // Ctrl+C is handled by rl.on('SIGINT') above:
+  // - During processing: interrupts and returns to prompt
+  // - At idle prompt: exits gracefully
 
   prompt();
 }
@@ -148,8 +152,9 @@ export async function startCLI() {
 async function handleUserInput(input, rl, agent) {
   _isBusy = true;
   _aborted = false;
+  _abortController = new AbortController();
 
-  // Create a cancel promise — ESC resolves this to win the race against agent.chat()
+  // Create a cancel promise — Ctrl+C resolves this to win the race against agent.chat()
   const cancelPromise = new Promise(resolve => { _cancelResolve = resolve; });
 
   let spinner = null;
@@ -173,7 +178,7 @@ async function handleUserInput(input, rl, agent) {
       const tps = streamElapsed > 0 ? (tokenCount / streamElapsed).toFixed(1) : '0.0';
       tokStr = colors.dim(` | ${tps} tok/s`);
     }
-    return colors.dim(`${verb}...`) + tokStr + colors.dim(` | ${formatDuration(elapsed * 1000)}`) + '  ' + colors.status('esc to interrupt');
+    return colors.dim(`${verb}...`) + tokStr + colors.dim(` | ${formatDuration(elapsed * 1000)}`) + '  ' + colors.status('ctrl+c to interrupt');
   }
 
   // Start spinner IMMEDIATELY so the user sees feedback right away
@@ -194,6 +199,7 @@ async function handleUserInput(input, rl, agent) {
 
   try {
     await Promise.race([cancelPromise, agent.chat(input, {
+      signal: _abortController.signal,
       onToken: (count) => {
         if (!streamStartTime) streamStartTime = Date.now();
         tokenCount += count;
@@ -278,8 +284,9 @@ async function handleUserInput(input, rl, agent) {
   if (spinner) { spinner.stop(); spinner = null; }
 
   _cancelResolve = null;
+  _abortController = null;
 
-  // If interrupted by ESC, show message and return — caller calls prompt()
+  // If interrupted by Ctrl+C, show message and return — caller calls prompt()
   // Conversation history is preserved so the user can add context or redirect.
   if (_aborted) {
     _aborted = false;
