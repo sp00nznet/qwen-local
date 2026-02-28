@@ -11,11 +11,9 @@ import { getAllSkills, getSkill, saveSkill, deleteSkill, expandSkillPrompt, matc
 import { loadAllMemory, clearGlobalMemory, clearProjectMemory, getMemoryStats } from './memory.js';
 import { colors, formatToolCall, truncate, contextBar, formatDuration } from './utils.js';
 
-// Module-level state so process SIGINT handler can abort in-flight requests
+// Module-level state for ESC interrupt handling
 let _isBusy = false;
 let _agent = null;
-let _rl = null;
-let _promptFn = null;
 let _aborted = false; // flag checked by handleUserInput to know it was interrupted
 
 export async function startCLI() {
@@ -41,7 +39,19 @@ export async function startCLI() {
     output: process.stdout,
     terminal: true,
   });
-  _rl = rl;
+
+  // Listen for ESC key to interrupt processing.
+  // Ctrl+C on Windows is too deeply tied to process termination — we don't fight it.
+  // ESC is clean: it's a normal keypress that readline passes through.
+  process.stdin.on('keypress', (str, key) => {
+    if (key && key.name === 'escape' && _isBusy) {
+      _agent.abort();
+      _aborted = true;
+      _isBusy = false;
+      console.log(colors.warning('\n\n  Interrupted.\n'));
+      // Don't call prompt — the abort resolves handleUserInput, normal flow calls prompt()
+    }
+  });
 
   // Helper to ask a question and get a response
   function ask(question) {
@@ -106,37 +116,9 @@ export async function startCLI() {
     });
   };
 
-  // Ctrl+C handler — readline stays active (not paused) so this always fires on Windows.
-  // IMPORTANT: Do NOT call prompt() here when busy — the abort will cause handleUserInput
-  // to return, and the normal flow in the question callback will call prompt().
-  // Calling prompt() from both places causes duplicate rl.question() which crashes on Windows.
-  rl.on('SIGINT', () => {
-    if (_isBusy) {
-      // Abort the in-flight request — handleUserInput checks _aborted to bail out
-      _agent.abort();
-      _aborted = true;
-      _isBusy = false;
-      console.log(colors.warning('\n\n  Interrupted.\n'));
-      // Don't call prompt — the abort resolves handleUserInput, normal flow calls prompt()
-    } else if (multilineBuffer !== null) {
-      multilineBuffer = null;
-      console.log(colors.dim('\n  (multiline cancelled)'));
-      _promptFn();
-    } else {
-      console.log(colors.dim('\n\n  Use /exit to quit.\n'));
-      _promptFn();
-    }
-  });
+  // Ctrl+C just exits the process (natural Windows behavior).
+  // Use ESC to soft-interrupt during processing.
 
-  // Prevent default process exit on Ctrl+C — the rl.on('SIGINT') handler above does the real work.
-  // Without this, Windows sends CTRL_C_EVENT → Node converts to SIGINT → default behavior is exit.
-  process.on('SIGINT', () => {});
-
-  // NOTE: We intentionally do NOT use rl.on('close') → process.exit() because on Windows,
-  // SIGINT can trigger readline to close itself, which would kill the process after Ctrl+C.
-  // Instead, /exit calls process.exit() directly.
-
-  _promptFn = prompt;
   prompt();
 }
 
@@ -154,7 +136,7 @@ async function handleUserInput(input, rl, agent) {
   // Start spinner IMMEDIATELY so the user sees feedback right away
   // (especially important for large CPU models that take a long time to start responding)
   thinkingSpinner = ora({
-    text: colors.dim('Thinking...'),
+    text: colors.dim('Thinking...') + '  ' + colors.status('ESC to interrupt'),
     indent: 2,
   }).start();
 
@@ -162,7 +144,7 @@ async function handleUserInput(input, rl, agent) {
   const thinkingInterval = setInterval(() => {
     if (thinkingSpinner) {
       const elapsed = Math.round((Date.now() - startTime) / 1000);
-      thinkingSpinner.text = colors.dim(`Thinking... (${elapsed}s)`);
+      thinkingSpinner.text = colors.dim(`Thinking... (${elapsed}s)`) + '  ' + colors.status('ESC to interrupt');
     } else {
       clearInterval(thinkingInterval);
     }
@@ -227,7 +209,7 @@ async function handleUserInput(input, rl, agent) {
         if (_aborted) return;
         if (isThinking && !thinkingSpinner) {
           thinkingSpinner = ora({
-            text: colors.dim('Thinking...'),
+            text: colors.dim('Thinking...') + '  ' + colors.status('ESC to interrupt'),
             indent: 2,
           }).start();
         } else if (!isThinking && thinkingSpinner) {
