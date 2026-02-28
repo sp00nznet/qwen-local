@@ -18,18 +18,31 @@ let _aborted = false;
 let _cancelResolve = null; // resolves the cancel promise to win the race
 let _abortController = null; // aborts the fetch to Ollama
 
-// On Windows, Ctrl+C generates BOTH:
-// 1. Byte 0x03 on stdin (handled by readline → rl.on('SIGINT'))
-// 2. CTRL_C_EVENT via SetConsoleCtrlHandler (→ process 'SIGINT')
-// Without a process-level handler, #2 kills the process even though #1 was handled.
-process.on('SIGINT', () => {
-  // Intentionally empty — prevents Windows from killing the process.
-  // The actual interrupt logic lives in rl.on('SIGINT') inside startCLI().
-});
+// ─── Debug logger: writes to ~/.qwen-local/debug.log ──────────────────
+// This traces every exit-related event so we can diagnose what kills the process.
+const _debugLogPath = path.join(process.env.HOME || process.env.USERPROFILE || '.', '.qwen-local', 'debug.log');
+function _dbg(msg) {
+  try {
+    const dir = path.dirname(_debugLogPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(_debugLogPath, `[${new Date().toISOString()}] ${msg}\n`);
+  } catch {}
+}
+// Truncate log on startup
+try { fs.writeFileSync(_debugLogPath, `=== qwen-local started ${new Date().toISOString()} ===\n`); } catch {}
+
+// Trace every possible exit path
+process.on('exit', (code) => { _dbg(`process.on('exit') code=${code}`); });
+process.on('SIGINT', () => { _dbg(`process.on('SIGINT') fired, _isBusy=${_isBusy}`); });
+process.on('SIGTERM', () => { _dbg(`process.on('SIGTERM') fired`); });
+process.on('beforeExit', (code) => { _dbg(`process.on('beforeExit') code=${code}`); });
 
 // Safety net: catch any stray promise rejections from abandoned streams.
-process.on('unhandledRejection', () => {});
+process.on('unhandledRejection', (reason) => {
+  _dbg(`unhandledRejection: ${reason?.message || reason}`);
+});
 process.on('uncaughtException', (err) => {
+  _dbg(`uncaughtException: ${err.message} (${err.code || err.name})`);
   // Only crash on real errors, not stream cleanup noise
   if (err.code === 'ERR_USE_AFTER_CLOSE' || err.name === 'AbortError' ||
       err.message?.includes('cancel') || err.message?.includes('abort')) return;
@@ -68,29 +81,34 @@ export async function startCLI() {
     terminal: true,
   });
 
-  // Ctrl+C interrupt: use rl.on('SIGINT') — NOT process.on('SIGINT').
-  // When readline has terminal: true, it intercepts Ctrl+C before process-level
-  // handlers fire. Registering on rl prevents readline from closing the interface
-  // and prevents the process from exiting — we handle it ourselves.
+  // Ctrl+C interrupt via rl.on('SIGINT').
+  // Registering on rl prevents readline from closing the interface.
   let _interruptedAt = 0;
   rl.on('SIGINT', () => {
+    _dbg(`rl.on('SIGINT') fired, _isBusy=${_isBusy}, _interruptedAt=${_interruptedAt}`);
     // Debounce: ignore SIGINTs within 1s of an interrupt to prevent double-fire
-    // (Windows can deliver multiple signals from a single Ctrl+C press)
-    if (_interruptedAt && Date.now() - _interruptedAt < 1000) return;
+    if (_interruptedAt && Date.now() - _interruptedAt < 1000) {
+      _dbg('  debounced — ignoring');
+      return;
+    }
 
     if (_isBusy) {
       _interruptedAt = Date.now();
-      // Interrupt the current operation
+      _dbg('  interrupting busy operation');
       _aborted = true;
       _isBusy = false;
       _agent.cancel();
-      if (_abortController) _abortController.abort(); // kills the fetch → stops Ollama
+      if (_abortController) _abortController.abort();
       if (_cancelResolve) { _cancelResolve(); _cancelResolve = null; }
     } else {
-      // Not busy — exit gracefully
-      console.log(colors.dim('\n  Goodbye!\n'));
-      process.exit(0);
+      _dbg('  NOT busy — would exit but NOT exiting (debug mode)');
+      // NOT calling process.exit — just show a message
+      console.log(colors.dim('\n  (Use /exit to quit)\n'));
     }
+  });
+
+  rl.on('close', () => {
+    _dbg('rl.on("close") fired — readline closed itself!');
   });
 
   // Helper to ask a question and get a response
@@ -107,6 +125,7 @@ export async function startCLI() {
   }
 
   const prompt = () => {
+    _dbg('prompt() called — calling rl.question()');
     rl.question(getPromptStr(), async (input) => {
       // Ignore any input that arrives while busy (shouldn't normally happen)
       if (_isBusy) return;
@@ -303,9 +322,11 @@ async function handleUserInput(input, rl, agent) {
   // If interrupted by Ctrl+C, show message and return — caller calls prompt()
   // Conversation history is preserved so the user can add context or redirect.
   if (_aborted) {
+    _dbg('handleUserInput: _aborted=true, showing interrupt message');
     _aborted = false;
     console.log(colors.warning('\n\n  Interrupted.'));
     console.log(colors.dim('  Add more context to redirect, or start a new request.\n'));
+    _dbg('handleUserInput: returning after interrupt, prompt() will be called next');
     return;
   }
 
