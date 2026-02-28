@@ -281,13 +281,14 @@ const _toolNames = new Set(toolDefinitions.map(t => t.function.name));
 function parseTextToolCalls(text) {
   const calls = [];
 
-  // Match ```json ... ``` blocks containing tool calls
-  const jsonBlockRegex = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*```/g;
+  // Strategy 1: Extract content between ```json ... ``` code fences
+  // Capture everything between fences, then try to parse as JSON.
+  const codeBlockRegex = /```(?:json)?\s*\n([\s\S]*?)\n\s*```/g;
   let match;
-  while ((match = jsonBlockRegex.exec(text)) !== null) {
+  while ((match = codeBlockRegex.exec(text)) !== null) {
+    const content = match[1].trim();
     try {
-      const obj = JSON.parse(match[1]);
-      // Check if it looks like a tool call: { name: "tool_name", arguments: { ... } }
+      const obj = JSON.parse(content);
       if (obj.name && _toolNames.has(obj.name)) {
         calls.push({
           id: `text_${Date.now()}_${calls.length}`,
@@ -301,24 +302,34 @@ function parseTextToolCalls(text) {
     } catch {}
   }
 
-  // Also try matching bare JSON objects (no code fence) that look like tool calls
+  // Strategy 2: Find bare JSON objects with brace counting (handles nested braces)
   if (calls.length === 0) {
-    const bareJsonRegex = /\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
-    while ((match = bareJsonRegex.exec(text)) !== null) {
+    const namePattern = /\{\s*"name"\s*:\s*"(\w+)"/g;
+    while ((match = namePattern.exec(text)) !== null) {
       const name = match[1];
-      if (_toolNames.has(name)) {
-        try {
-          const args = JSON.parse(match[2]);
+      if (!_toolNames.has(name)) continue;
+      // Found a tool name — now extract the full JSON object using brace counting
+      const startIdx = match.index;
+      let depth = 0;
+      let endIdx = -1;
+      for (let i = startIdx; i < text.length; i++) {
+        if (text[i] === '{') depth++;
+        else if (text[i] === '}') { depth--; if (depth === 0) { endIdx = i + 1; break; } }
+      }
+      if (endIdx === -1) continue;
+      try {
+        const obj = JSON.parse(text.slice(startIdx, endIdx));
+        if (obj.name && obj.arguments) {
           calls.push({
             id: `text_${Date.now()}_${calls.length}`,
             type: 'function',
             function: {
-              name,
-              arguments: JSON.stringify(args)
+              name: obj.name,
+              arguments: JSON.stringify(obj.arguments)
             }
           });
-        } catch {}
-      }
+        }
+      } catch {}
     }
   }
 

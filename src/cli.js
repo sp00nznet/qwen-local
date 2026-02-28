@@ -272,15 +272,17 @@ async function handleUserInput(input, rl, agent) {
       },
       onThinking: (isThinking) => {
         if (_aborted) return;
+        // Don't stop the spinner — text is buffered so the spinner is the
+        // only feedback the user sees. It'll be stopped when tool calls
+        // appear, text is flushed, or the response completes.
         if (isThinking && !thinkingSpinner) {
           thinkingSpinner = ora({
             text: buildThinkingText(),
             indent: 2,
           }).start();
-        } else if (!isThinking && thinkingSpinner) {
-          thinkingSpinner.stop();
-          thinkingSpinner = null;
         }
+        // Note: we intentionally do NOT stop the spinner on isThinking=false.
+        // Text is buffered, so the spinner is the user's only feedback during generation.
       },
     })]);
   } catch (err) {
@@ -311,6 +313,7 @@ async function handleUserInput(input, rl, agent) {
   // If tool calls were made (structured or text-parsed), the text was likely JSON
   // tool call syntax that we suppress in favor of clean formatted output.
   if (textBuffer && !hasToolCalls) {
+    if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
     process.stdout.write('\n  ');
     const formatted = textBuffer.replace(/\n/g, '\n  ');
     process.stdout.write(formatted);
