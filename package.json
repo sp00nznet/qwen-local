@@ -1,0 +1,17 @@
+{
+  "name": "qwen-local",
+  "version": "1.0.0",
+  "description": "A Claude Code-like agentic CLI powered by Qwen3-Coder via Ollama",
+  "bin": {
+    "qwen-local": "./bin/qwen-local.js"
+  },
+  "scripts": {
+    "start": "node bin/qwen-local.js"
+  },
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "ora": "^8.0.1"
+  },
+  "type": "module",
+  "license": "MIT"
+}
