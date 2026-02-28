@@ -14,18 +14,8 @@ import { colors, formatToolCall, truncate, contextBar, formatDuration } from './
 // Module-level state for ESC interrupt handling
 let _isBusy = false;
 let _agent = null;
-let _aborted = false; // flag checked by handleUserInput to know it was interrupted
-
-// Catch stray errors from aborted fetch streams — prevents crash on interrupt
-process.on('uncaughtException', (err) => {
-  if (err.name === 'AbortError') return;
-  console.error('\n  Unexpected error:', err.message);
-  process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-  if (reason && reason.name === 'AbortError') return;
-  // Silently ignore — these are usually from aborted stream cleanup
-});
+let _aborted = false;
+let _cancelResolve = null; // resolves the cancel promise to win the race
 
 // Rotating verbs for the thinking spinner
 const THINKING_VERBS = [
@@ -59,15 +49,17 @@ export async function startCLI() {
   });
 
   // Listen for ESC key to interrupt processing.
-  // Ctrl+C on Windows is too deeply tied to process termination — we don't fight it.
-  // ESC is clean: it's a normal keypress that readline passes through.
+  // We don't use Ctrl+C — on Windows it's hardwired to kill the process.
+  // ESC is a clean keypress that readline passes through without side effects.
   process.stdin.on('keypress', (str, key) => {
     if (key && key.name === 'escape' && _isBusy) {
-      _agent.abort();
       _aborted = true;
       _isBusy = false;
-      console.log(colors.warning('\n\n  Interrupted.\n'));
-      // Don't call prompt — the abort resolves handleUserInput, normal flow calls prompt()
+      _agent.cancel(); // sets flag so callbacks become no-ops
+      if (_cancelResolve) {
+        _cancelResolve(); // resolves the cancel promise, wins the race
+        _cancelResolve = null;
+      }
     }
   });
 
@@ -144,6 +136,9 @@ async function handleUserInput(input, rl, agent) {
   _isBusy = true;
   _aborted = false;
 
+  // Create a cancel promise — ESC resolves this to win the race against agent.chat()
+  const cancelPromise = new Promise(resolve => { _cancelResolve = resolve; });
+
   let spinner = null;
   let thinkingSpinner = null;
   let hasOutput = false;
@@ -185,7 +180,7 @@ async function handleUserInput(input, rl, agent) {
   }, 1000);
 
   try {
-    await agent.chat(input, {
+    await Promise.race([cancelPromise, agent.chat(input, {
       onToken: (count) => {
         if (!streamStartTime) streamStartTime = Date.now();
         tokenCount += count;
@@ -255,7 +250,7 @@ async function handleUserInput(input, rl, agent) {
           thinkingSpinner = null;
         }
       },
-    });
+    })]);
   } catch (err) {
     if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
     if (spinner) { spinner.fail('Error'); spinner = null; }
@@ -269,9 +264,12 @@ async function handleUserInput(input, rl, agent) {
   if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
   if (spinner) { spinner.stop(); spinner = null; }
 
-  // If aborted by ESC, skip the stats line — just return and let caller call prompt()
+  _cancelResolve = null;
+
+  // If interrupted by ESC, show message and return — caller calls prompt()
   if (_aborted) {
     _aborted = false;
+    console.log(colors.warning('\n\n  Interrupted.\n'));
     return;
   }
 

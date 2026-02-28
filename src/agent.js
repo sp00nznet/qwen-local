@@ -9,9 +9,7 @@ export function createAgent() {
   let initialized = false;
   let totalToolCalls = 0;
   let totalTurns = 0;
-  let totalTokensReceived = 0;
-  let _aborted = false;
-  let currentAbortController = null;
+  let _cancelled = false;
 
   function initSystem() {
     if (!initialized) {
@@ -23,7 +21,6 @@ export function createAgent() {
     }
   }
 
-  // Refresh system prompt (e.g., when mode changes)
   function refreshSystemPrompt() {
     const prompt = buildSystemPrompt(getWorkingDirectory(), getPlanMode() ? 'plan' : 'normal');
     if (messages.length > 0 && messages[0].role === 'system') {
@@ -33,44 +30,36 @@ export function createAgent() {
 
   async function chat(userMessage, { onText, onToolCall, onToolResult, onError, onCompact, onThinking, onToken }) {
     initSystem();
-    _aborted = false;
+    _cancelled = false;
     messages.push({ role: 'user', content: userMessage });
     totalTurns++;
 
-    // Check if we need to compact before sending
     if (shouldCompact(messages)) {
       const before = messages.length;
       messages = compactMessages(messages);
-      if (onCompact) {
-        onCompact(before, messages.length);
-      }
+      if (onCompact) onCompact(before, messages.length);
     }
 
     const config = getConfig();
     const ollamaUrl = `${config.ollamaUrl}/v1/chat/completions`;
     const model = config.model;
 
-    // Agent loop: keep going until the model produces a text-only response
     let loopCount = 0;
-    const maxLoops = 25; // safety limit
+    const maxLoops = 25;
 
-    while (loopCount < maxLoops && !_aborted) {
+    while (loopCount < maxLoops && !_cancelled) {
       loopCount++;
-      currentAbortController = new AbortController();
-      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken }, currentAbortController.signal);
-      currentAbortController = null;
-      if (!assistantMessage || _aborted) return;
+      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken }, () => _cancelled);
+      if (!assistantMessage || _cancelled) return;
 
       messages.push(assistantMessage);
 
-      // If no tool calls, we're done
       if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
         return;
       }
 
-      // Execute each tool call
       for (const toolCall of assistantMessage.tool_calls) {
-        if (_aborted) return;
+        if (_cancelled) return;
         const fnName = toolCall.function.name;
         let args = {};
         try {
@@ -82,7 +71,7 @@ export function createAgent() {
         totalToolCalls++;
         onToolCall(fnName, args);
         const result = await executeTool(fnName, args);
-        if (_aborted) return;
+        if (_cancelled) return;
         onToolResult(fnName, result);
 
         messages.push({
@@ -92,13 +81,10 @@ export function createAgent() {
         });
       }
 
-      // Check if we need to compact after adding tool results
       if (shouldCompact(messages)) {
         const before = messages.length;
         messages = compactMessages(messages);
-        if (onCompact) {
-          onCompact(before, messages.length);
-        }
+        if (onCompact) onCompact(before, messages.length);
       }
     }
 
@@ -112,12 +98,9 @@ export function createAgent() {
     initialized = false;
     totalToolCalls = 0;
     totalTurns = 0;
-    totalTokensReceived = 0;
   }
 
-  function getMessages() {
-    return messages;
-  }
+  function getMessages() { return messages; }
 
   function setMessages(newMessages) {
     messages = newMessages;
@@ -131,22 +114,18 @@ export function createAgent() {
       messageCount: messages.length,
       totalToolCalls,
       totalTurns,
-      totalTokensReceived,
     };
   }
 
-  function abort() {
-    _aborted = true;
-    if (currentAbortController) {
-      try { currentAbortController.abort(); } catch {}
-      currentAbortController = null;
-    }
+  // Cancel the current operation — sets flag, does NOT abort fetch
+  function cancel() {
+    _cancelled = true;
   }
 
-  return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats, abort };
+  return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats, cancel };
 }
 
-async function callOllama(url, model, messages, { onText, onError, onThinking, onToken }, abortSignal) {
+async function callOllama(url, model, messages, { onText, onError, onThinking, onToken }, isCancelled) {
   const body = {
     model,
     messages,
@@ -154,8 +133,6 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
     stream: true,
   };
 
-  // Signal thinking BEFORE the fetch — on large CPU models, the fetch itself
-  // can block for minutes while Ollama loads/processes. The user needs feedback NOW.
   if (onThinking) onThinking(true);
 
   let response;
@@ -164,11 +141,9 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: abortSignal,
     });
   } catch (err) {
     if (onThinking) onThinking(false);
-    if (err.name === 'AbortError') return null;
     onError(`Failed to connect to Ollama at ${url}. Is Ollama running?\n${err.message}`);
     return null;
   }
@@ -188,76 +163,89 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
   let toolCalls = {};
   let firstToken = true;
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  while (true) {
+    // Check cancelled before each read
+    if (isCancelled()) {
+      if (onThinking) onThinking(false);
+      // Try to cancel the reader to free resources (but don't crash if it fails)
+      try { reader.cancel(); } catch {}
+      return null;
+    }
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
+    let readResult;
+    try {
+      readResult = await reader.read();
+    } catch {
+      // Stream error (connection closed, etc.) — just bail
+      if (onThinking) onThinking(false);
+      return null;
+    }
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const data = trimmed.slice(6);
-        if (data === '[DONE]') continue;
+    const { done, value } = readResult;
+    if (done) break;
 
-        let chunk;
-        try {
-          chunk = JSON.parse(data);
-        } catch {
-          continue;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+
+    for (const line of lines) {
+      if (isCancelled()) {
+        if (onThinking) onThinking(false);
+        try { reader.cancel(); } catch {}
+        return null;
+      }
+
+      const trimmed = line.trim();
+      if (!trimmed || !trimmed.startsWith('data: ')) continue;
+      const data = trimmed.slice(6);
+      if (data === '[DONE]') continue;
+
+      let chunk;
+      try {
+        chunk = JSON.parse(data);
+      } catch {
+        continue;
+      }
+
+      const choice = chunk.choices?.[0];
+      if (!choice) continue;
+
+      const delta = choice.delta;
+      if (!delta) continue;
+
+      if (delta.content) {
+        if (firstToken && onThinking) {
+          onThinking(false);
+          firstToken = false;
         }
+        contentParts.push(delta.content);
+        if (onToken) onToken(Math.max(1, Math.round(delta.content.length / 4)));
+        onText(delta.content);
+      }
 
-        const choice = chunk.choices?.[0];
-        if (!choice) continue;
-
-        const delta = choice.delta;
-        if (!delta) continue;
-
-        if (delta.content) {
-          if (firstToken && onThinking) {
-            onThinking(false);
-            firstToken = false;
-          }
-          contentParts.push(delta.content);
-          // Estimate tokens (~4 chars per token) and notify
-          if (onToken) onToken(Math.max(1, Math.round(delta.content.length / 4)));
-          onText(delta.content);
+      if (delta.tool_calls) {
+        if (firstToken && onThinking) {
+          onThinking(false);
+          firstToken = false;
         }
-
-        if (delta.tool_calls) {
-          if (firstToken && onThinking) {
-            onThinking(false);
-            firstToken = false;
+        for (const tc of delta.tool_calls) {
+          const idx = tc.index ?? 0;
+          if (!toolCalls[idx]) {
+            toolCalls[idx] = {
+              id: tc.id || `call_${idx}_${Date.now()}`,
+              type: 'function',
+              function: { name: '', arguments: '' }
+            };
           }
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            if (!toolCalls[idx]) {
-              toolCalls[idx] = {
-                id: tc.id || `call_${idx}_${Date.now()}`,
-                type: 'function',
-                function: { name: '', arguments: '' }
-              };
-            }
-            if (tc.id) toolCalls[idx].id = tc.id;
-            if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
-            if (tc.function?.arguments) {
-              toolCalls[idx].function.arguments += tc.function.arguments;
-              if (onToken) onToken(Math.max(1, Math.round(tc.function.arguments.length / 4)));
-            }
+          if (tc.id) toolCalls[idx].id = tc.id;
+          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+          if (tc.function?.arguments) {
+            toolCalls[idx].function.arguments += tc.function.arguments;
+            if (onToken) onToken(Math.max(1, Math.round(tc.function.arguments.length / 4)));
           }
         }
       }
     }
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      if (onThinking) onThinking(false);
-      try { reader.cancel(); } catch {}
-      return null;
-    }
-    throw err;
   }
 
   if (onThinking) onThinking(false);
@@ -266,12 +254,8 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
   const toolCallArray = Object.values(toolCalls);
 
   const assistantMessage = { role: 'assistant' };
-  if (fullContent) {
-    assistantMessage.content = fullContent;
-  }
-  if (toolCallArray.length > 0) {
-    assistantMessage.tool_calls = toolCallArray;
-  }
+  if (fullContent) assistantMessage.content = fullContent;
+  if (toolCallArray.length > 0) assistantMessage.tool_calls = toolCallArray;
 
   return assistantMessage;
 }
