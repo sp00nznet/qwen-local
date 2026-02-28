@@ -58,6 +58,9 @@ export async function startCLI() {
 
   const prompt = () => {
     rl.question(getPromptStr(), async (input) => {
+      // Ignore any input that arrives while busy (shouldn't normally happen)
+      if (_isBusy) return;
+
       // --- Multiline input mode ---
       if (multilineBuffer !== null) {
         if (input.trim() === '"""' || input.trim() === "'''") {
@@ -103,16 +106,14 @@ export async function startCLI() {
     });
   };
 
-  // Use process-level SIGINT so it works even when readline is paused
-  // (readline's own SIGINT handler doesn't fire when rl.pause() is active)
-  process.on('SIGINT', () => {
+  // Ctrl+C handler — readline stays active so this always fires on Windows
+  rl.on('SIGINT', () => {
     if (_isBusy) {
       // Abort the in-flight request — handleUserInput checks _aborted to bail out
       _agent.abort();
       _aborted = true;
       _isBusy = false;
       console.log(colors.warning('\n\n  Interrupted.\n'));
-      _rl.resume();
       _promptFn();
     } else if (multilineBuffer !== null) {
       multilineBuffer = null;
@@ -120,6 +121,17 @@ export async function startCLI() {
       _promptFn();
     } else {
       console.log(colors.dim('\n\n  Use /exit to quit.\n'));
+      _promptFn();
+    }
+  });
+
+  // Fallback: catch process SIGINT too in case readline misses it
+  process.on('SIGINT', () => {
+    if (_isBusy) {
+      _agent.abort();
+      _aborted = true;
+      _isBusy = false;
+      console.log(colors.warning('\n\n  Interrupted.\n'));
       _promptFn();
     }
   });
@@ -133,7 +145,8 @@ export async function startCLI() {
 }
 
 async function handleUserInput(input, rl, agent) {
-  rl.pause();
+  // NOTE: we do NOT pause readline — on Windows, pausing kills stdin and
+  // prevents Ctrl+C from working. Instead we use the _isBusy flag to ignore input.
   _isBusy = true;
   _aborted = false;
 
@@ -240,7 +253,7 @@ async function handleUserInput(input, rl, agent) {
   if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
   if (spinner) { spinner.stop(); spinner = null; }
 
-  // If aborted by Ctrl+C, the SIGINT handler already resumed rl and called prompt
+  // If aborted by Ctrl+C, the SIGINT handler already called prompt
   if (_aborted) {
     _aborted = false;
     return;
@@ -256,8 +269,6 @@ async function handleUserInput(input, rl, agent) {
   const stats = agent.getStats();
   console.log(colors.status(`\n  ${formatDuration(elapsed)} | context: ${contextBar(stats.pct)} | ${stats.messageCount} msgs | ${stats.totalToolCalls} tool calls`));
   console.log();
-
-  rl.resume();
 }
 
 async function handleCommand(cmd, rl, agent, ask) {
