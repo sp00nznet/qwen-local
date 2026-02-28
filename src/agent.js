@@ -9,6 +9,8 @@ export function createAgent() {
   let initialized = false;
   let totalToolCalls = 0;
   let totalTurns = 0;
+  let totalTokensReceived = 0;
+  let _aborted = false;
   let currentAbortController = null;
 
   function initSystem() {
@@ -29,8 +31,9 @@ export function createAgent() {
     }
   }
 
-  async function chat(userMessage, { onText, onToolCall, onToolResult, onError, onCompact, onThinking }) {
+  async function chat(userMessage, { onText, onToolCall, onToolResult, onError, onCompact, onThinking, onToken }) {
     initSystem();
+    _aborted = false;
     messages.push({ role: 'user', content: userMessage });
     totalTurns++;
 
@@ -51,12 +54,12 @@ export function createAgent() {
     let loopCount = 0;
     const maxLoops = 25; // safety limit
 
-    while (loopCount < maxLoops) {
+    while (loopCount < maxLoops && !_aborted) {
       loopCount++;
       currentAbortController = new AbortController();
-      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking }, currentAbortController.signal);
+      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken }, currentAbortController.signal);
       currentAbortController = null;
-      if (!assistantMessage) return;
+      if (!assistantMessage || _aborted) return;
 
       messages.push(assistantMessage);
 
@@ -67,6 +70,7 @@ export function createAgent() {
 
       // Execute each tool call
       for (const toolCall of assistantMessage.tool_calls) {
+        if (_aborted) return;
         const fnName = toolCall.function.name;
         let args = {};
         try {
@@ -78,6 +82,7 @@ export function createAgent() {
         totalToolCalls++;
         onToolCall(fnName, args);
         const result = await executeTool(fnName, args);
+        if (_aborted) return;
         onToolResult(fnName, result);
 
         messages.push({
@@ -107,6 +112,7 @@ export function createAgent() {
     initialized = false;
     totalToolCalls = 0;
     totalTurns = 0;
+    totalTokensReceived = 0;
   }
 
   function getMessages() {
@@ -125,12 +131,14 @@ export function createAgent() {
       messageCount: messages.length,
       totalToolCalls,
       totalTurns,
+      totalTokensReceived,
     };
   }
 
   function abort() {
+    _aborted = true;
     if (currentAbortController) {
-      currentAbortController.abort();
+      try { currentAbortController.abort(); } catch {}
       currentAbortController = null;
     }
   }
@@ -138,7 +146,7 @@ export function createAgent() {
   return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats, abort };
 }
 
-async function callOllama(url, model, messages, { onText, onError, onThinking }, abortSignal) {
+async function callOllama(url, model, messages, { onText, onError, onThinking, onToken }, abortSignal) {
   const body = {
     model,
     messages,
@@ -160,16 +168,15 @@ async function callOllama(url, model, messages, { onText, onError, onThinking },
     });
   } catch (err) {
     if (onThinking) onThinking(false);
-    if (err.name === 'AbortError') {
-      return null; // silently return — user cancelled with Ctrl+C
-    }
+    if (err.name === 'AbortError') return null;
     onError(`Failed to connect to Ollama at ${url}. Is Ollama running?\n${err.message}`);
     return null;
   }
 
   if (!response.ok) {
     if (onThinking) onThinking(false);
-    const text = await response.text();
+    let text = '';
+    try { text = await response.text(); } catch {}
     onError(`Ollama API error (${response.status}): ${text}`);
     return null;
   }
@@ -215,6 +222,8 @@ async function callOllama(url, model, messages, { onText, onError, onThinking },
             firstToken = false;
           }
           contentParts.push(delta.content);
+          // Estimate tokens (~4 chars per token) and notify
+          if (onToken) onToken(Math.max(1, Math.round(delta.content.length / 4)));
           onText(delta.content);
         }
 
@@ -234,7 +243,10 @@ async function callOllama(url, model, messages, { onText, onError, onThinking },
             }
             if (tc.id) toolCalls[idx].id = tc.id;
             if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
-            if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+            if (tc.function?.arguments) {
+              toolCalls[idx].function.arguments += tc.function.arguments;
+              if (onToken) onToken(Math.max(1, Math.round(tc.function.arguments.length / 4)));
+            }
           }
         }
       }

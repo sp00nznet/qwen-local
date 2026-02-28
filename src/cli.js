@@ -16,6 +16,24 @@ let _isBusy = false;
 let _agent = null;
 let _aborted = false; // flag checked by handleUserInput to know it was interrupted
 
+// Catch stray errors from aborted fetch streams — prevents crash on interrupt
+process.on('uncaughtException', (err) => {
+  if (err.name === 'AbortError') return;
+  console.error('\n  Unexpected error:', err.message);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  if (reason && reason.name === 'AbortError') return;
+  // Silently ignore — these are usually from aborted stream cleanup
+});
+
+// Rotating verbs for the thinking spinner
+const THINKING_VERBS = [
+  'Thinking', 'Reasoning', 'Analyzing', 'Considering', 'Processing',
+  'Evaluating', 'Reflecting', 'Pondering', 'Working', 'Computing',
+  'Examining', 'Deliberating', 'Formulating', 'Assessing', 'Exploring',
+];
+
 export async function startCLI() {
   const cwd = process.cwd();
   setWorkingDirectory(cwd);
@@ -123,8 +141,6 @@ export async function startCLI() {
 }
 
 async function handleUserInput(input, rl, agent) {
-  // NOTE: we do NOT pause readline — on Windows, pausing kills stdin and
-  // prevents Ctrl+C from working. Instead we use the _isBusy flag to ignore input.
   _isBusy = true;
   _aborted = false;
 
@@ -132,19 +148,37 @@ async function handleUserInput(input, rl, agent) {
   let thinkingSpinner = null;
   let hasOutput = false;
   const startTime = Date.now();
+  let tokenCount = 0;
+  let streamStartTime = null;
+  let verbIndex = Math.floor(Math.random() * THINKING_VERBS.length);
+
+  function getVerb() {
+    return THINKING_VERBS[verbIndex % THINKING_VERBS.length];
+  }
+
+  function buildThinkingText() {
+    const elapsed = Math.round((Date.now() - startTime) / 1000);
+    const verb = getVerb();
+    let tokStr = '';
+    if (streamStartTime && tokenCount > 0) {
+      const streamElapsed = (Date.now() - streamStartTime) / 1000;
+      const tps = streamElapsed > 0 ? (tokenCount / streamElapsed).toFixed(1) : '0.0';
+      tokStr = colors.dim(` | ${tps} tok/s`);
+    }
+    return colors.dim(`${verb}...`) + tokStr + colors.dim(` | ${formatDuration(elapsed * 1000)}`) + '  ' + colors.status('esc to interrupt');
+  }
 
   // Start spinner IMMEDIATELY so the user sees feedback right away
-  // (especially important for large CPU models that take a long time to start responding)
   thinkingSpinner = ora({
-    text: colors.dim('Thinking...') + '  ' + colors.status('ESC to interrupt'),
+    text: buildThinkingText(),
     indent: 2,
   }).start();
 
-  // Update spinner with elapsed time so user knows it's still alive
+  // Update spinner every second — cycle verb, update timer + token counter
   const thinkingInterval = setInterval(() => {
     if (thinkingSpinner) {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      thinkingSpinner.text = colors.dim(`Thinking... (${elapsed}s)`) + '  ' + colors.status('ESC to interrupt');
+      verbIndex++;
+      thinkingSpinner.text = buildThinkingText();
     } else {
       clearInterval(thinkingInterval);
     }
@@ -152,6 +186,10 @@ async function handleUserInput(input, rl, agent) {
 
   try {
     await agent.chat(input, {
+      onToken: (count) => {
+        if (!streamStartTime) streamStartTime = Date.now();
+        tokenCount += count;
+      },
       onText: (text) => {
         if (_aborted) return;
         if (thinkingSpinner) {
@@ -209,7 +247,7 @@ async function handleUserInput(input, rl, agent) {
         if (_aborted) return;
         if (isThinking && !thinkingSpinner) {
           thinkingSpinner = ora({
-            text: colors.dim('Thinking...') + '  ' + colors.status('ESC to interrupt'),
+            text: buildThinkingText(),
             indent: 2,
           }).start();
         } else if (!isThinking && thinkingSpinner) {
@@ -231,7 +269,7 @@ async function handleUserInput(input, rl, agent) {
   if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
   if (spinner) { spinner.stop(); spinner = null; }
 
-  // If aborted by Ctrl+C, skip the stats line — just return and let caller call prompt()
+  // If aborted by ESC, skip the stats line — just return and let caller call prompt()
   if (_aborted) {
     _aborted = false;
     return;
@@ -245,7 +283,10 @@ async function handleUserInput(input, rl, agent) {
 
   const elapsed = Date.now() - startTime;
   const stats = agent.getStats();
-  console.log(colors.status(`\n  ${formatDuration(elapsed)} | context: ${contextBar(stats.pct)} | ${stats.messageCount} msgs | ${stats.totalToolCalls} tool calls`));
+  const tpsStr = streamStartTime && tokenCount > 0
+    ? ` | ${(tokenCount / ((Date.now() - streamStartTime) / 1000)).toFixed(1)} tok/s`
+    : '';
+  console.log(colors.status(`\n  ${formatDuration(elapsed)} | context: ${contextBar(stats.pct)} | ${stats.messageCount} msgs | ${stats.totalToolCalls} tool calls${tpsStr}`));
   console.log();
 }
 
