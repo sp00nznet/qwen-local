@@ -267,9 +267,11 @@ async function handleUserInput(input, rl, agent) {
   _cancelResolve = null;
 
   // If interrupted by ESC, show message and return — caller calls prompt()
+  // Conversation history is preserved so the user can add context or redirect.
   if (_aborted) {
     _aborted = false;
-    console.log(colors.warning('\n\n  Interrupted.\n'));
+    console.log(colors.warning('\n\n  Interrupted.'));
+    console.log(colors.dim('  Add more context to redirect, or start a new request.\n'));
     return;
   }
 
