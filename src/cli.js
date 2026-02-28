@@ -16,7 +16,19 @@ let _isBusy = false;
 let _agent = null;
 let _aborted = false;
 let _cancelResolve = null; // resolves the cancel promise to win the race
-let _abortController = null; // aborts the fetch to Ollama
+
+// Process-level SIGINT fallback.
+// In raw mode, Ctrl+C produces byte 0x03 which readline handles (rl.on('SIGINT')).
+// If raw mode is ever lost, Ctrl+C generates OS-level SIGINT instead — this catches it.
+process.on('SIGINT', () => {
+  if (_isBusy) {
+    _aborted = true;
+    _isBusy = false;
+    if (_agent) _agent.cancel();
+    if (_cancelResolve) { _cancelResolve(); _cancelResolve = null; }
+  }
+  // Don't exit and don't swallow — let the normal flow handle the rest
+});
 
 // Safety net: catch any stray promise rejections from abandoned streams.
 process.on('unhandledRejection', () => {});
@@ -76,7 +88,8 @@ export async function startCLI() {
       _aborted = true;
       _isBusy = false;
       _agent.cancel();
-      if (_abortController) _abortController.abort();
+      // NO AbortController — abort() corrupts stdin raw mode on Windows,
+      // breaking all subsequent Ctrl+C detection. The stream drains naturally.
       if (_cancelResolve) { _cancelResolve(); _cancelResolve = null; }
     } else {
       console.log(colors.dim('\n  Goodbye!\n'));
@@ -98,7 +111,8 @@ export async function startCLI() {
   }
 
   const prompt = () => {
-    // Re-ensure stdin is active after abort (AbortController can leave it unrefed)
+    // Defensive: restore raw mode and resume stdin in case anything corrupted them
+    try { if (process.stdin.isTTY && !process.stdin.isRaw) process.stdin.setRawMode(true); } catch {}
     if (process.stdin.isPaused?.()) process.stdin.resume();
     rl.question(getPromptStr(), async (input) => {
       // Ignore any input that arrives while busy (shouldn't normally happen)
@@ -159,7 +173,6 @@ export async function startCLI() {
 async function handleUserInput(input, rl, agent) {
   _isBusy = true;
   _aborted = false;
-  _abortController = new AbortController();
 
   // Create a cancel promise — Ctrl+C resolves this to win the race against agent.chat()
   const cancelPromise = new Promise(resolve => { _cancelResolve = resolve; });
@@ -206,7 +219,6 @@ async function handleUserInput(input, rl, agent) {
 
   try {
     await Promise.race([cancelPromise, agent.chat(input, {
-      signal: _abortController.signal,
       onToken: (count) => {
         if (!streamStartTime) streamStartTime = Date.now();
         tokenCount += count;
@@ -291,7 +303,6 @@ async function handleUserInput(input, rl, agent) {
   if (spinner) { spinner.stop(); spinner = null; }
 
   _cancelResolve = null;
-  _abortController = null;
 
   // If interrupted by Ctrl+C, show message and return — caller calls prompt()
   // Conversation history is preserved so the user can add context or redirect.
