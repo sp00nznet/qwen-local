@@ -184,6 +184,8 @@ async function handleUserInput(input, rl, agent) {
   let tokenCount = 0;
   let streamStartTime = null;
   let verbIndex = Math.floor(Math.random() * THINKING_VERBS.length);
+  let textBuffer = '';       // Buffer text output — flush after response completes
+  let hasToolCalls = false;  // Set when onToolCall fires (structured or text-parsed)
 
   function getVerb() {
     return THINKING_VERBS[verbIndex % THINKING_VERBS.length];
@@ -225,23 +227,15 @@ async function handleUserInput(input, rl, agent) {
       },
       onText: (text) => {
         if (_aborted) return;
-        if (thinkingSpinner) {
-          thinkingSpinner.stop();
-          thinkingSpinner = null;
-        }
-        if (spinner) {
-          spinner.stop();
-          spinner = null;
-        }
-        if (!hasOutput) {
-          process.stdout.write('\n  ');
-          hasOutput = true;
-        }
-        const formatted = text.replace(/\n/g, '\n  ');
-        process.stdout.write(formatted);
+        // Buffer text — don't display yet. If the model is writing tool calls
+        // as JSON text, we'll suppress the raw JSON and show clean formatted
+        // tool call output instead. If it's a normal text response (no tool
+        // calls), we flush the buffer after the response completes.
+        textBuffer += text;
       },
       onToolCall: (name, args) => {
         if (_aborted) return;
+        hasToolCalls = true;
         if (thinkingSpinner) {
           thinkingSpinner.stop();
           thinkingSpinner = null;
@@ -311,6 +305,16 @@ async function handleUserInput(input, rl, agent) {
     console.log(colors.warning('\n\n  Interrupted.'));
     console.log(colors.dim('  Add more context to redirect, or start a new request.\n'));
     return;
+  }
+
+  // Flush text buffer: if the model produced text but no tool calls, display it now.
+  // If tool calls were made (structured or text-parsed), the text was likely JSON
+  // tool call syntax that we suppress in favor of clean formatted output.
+  if (textBuffer && !hasToolCalls) {
+    process.stdout.write('\n  ');
+    const formatted = textBuffer.replace(/\n/g, '\n  ');
+    process.stdout.write(formatted);
+    hasOutput = true;
   }
 
   if (hasOutput) {
