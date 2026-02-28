@@ -106,7 +106,10 @@ export async function startCLI() {
     });
   };
 
-  // Ctrl+C handler — readline stays active so this always fires on Windows
+  // Ctrl+C handler — readline stays active (not paused) so this always fires on Windows.
+  // IMPORTANT: Do NOT call prompt() here when busy — the abort will cause handleUserInput
+  // to return, and the normal flow in the question callback will call prompt().
+  // Calling prompt() from both places causes duplicate rl.question() which crashes on Windows.
   rl.on('SIGINT', () => {
     if (_isBusy) {
       // Abort the in-flight request — handleUserInput checks _aborted to bail out
@@ -114,24 +117,13 @@ export async function startCLI() {
       _aborted = true;
       _isBusy = false;
       console.log(colors.warning('\n\n  Interrupted.\n'));
-      _promptFn();
+      // Don't call prompt — the abort resolves handleUserInput, normal flow calls prompt()
     } else if (multilineBuffer !== null) {
       multilineBuffer = null;
       console.log(colors.dim('\n  (multiline cancelled)'));
       _promptFn();
     } else {
       console.log(colors.dim('\n\n  Use /exit to quit.\n'));
-      _promptFn();
-    }
-  });
-
-  // Fallback: catch process SIGINT too in case readline misses it
-  process.on('SIGINT', () => {
-    if (_isBusy) {
-      _agent.abort();
-      _aborted = true;
-      _isBusy = false;
-      console.log(colors.warning('\n\n  Interrupted.\n'));
       _promptFn();
     }
   });
@@ -253,7 +245,7 @@ async function handleUserInput(input, rl, agent) {
   if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
   if (spinner) { spinner.stop(); spinner = null; }
 
-  // If aborted by Ctrl+C, the SIGINT handler already called prompt
+  // If aborted by Ctrl+C, skip the stats line — just return and let caller call prompt()
   if (_aborted) {
     _aborted = false;
     return;
