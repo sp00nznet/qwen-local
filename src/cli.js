@@ -119,6 +119,23 @@ async function handleUserInput(input, rl, agent) {
   let hasOutput = false;
   const startTime = Date.now();
 
+  // Start spinner IMMEDIATELY so the user sees feedback right away
+  // (especially important for large CPU models that take a long time to start responding)
+  thinkingSpinner = ora({
+    text: colors.dim('Thinking...'),
+    indent: 2,
+  }).start();
+
+  // Update spinner with elapsed time so user knows it's still alive
+  const thinkingInterval = setInterval(() => {
+    if (thinkingSpinner) {
+      const elapsed = Math.round((Date.now() - startTime) / 1000);
+      thinkingSpinner.text = colors.dim(`Thinking... (${elapsed}s)`);
+    } else {
+      clearInterval(thinkingInterval);
+    }
+  }, 1000);
+
   try {
     await agent.chat(input, {
       onText: (text) => {
@@ -182,10 +199,14 @@ async function handleUserInput(input, rl, agent) {
       },
     });
   } catch (err) {
-    if (thinkingSpinner) thinkingSpinner.stop();
+    if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
     if (spinner) spinner.fail('Error');
     console.log('\n  ' + colors.error(`Unexpected error: ${err.message}`));
   }
+
+  // Always clean up the timer
+  clearInterval(thinkingInterval);
+  if (thinkingSpinner) { thinkingSpinner.stop(); thinkingSpinner = null; }
 
   if (hasOutput) {
     process.stdout.write('\n');

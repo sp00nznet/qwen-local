@@ -136,6 +136,10 @@ async function callOllama(url, model, messages, { onText, onError, onThinking })
     stream: true,
   };
 
+  // Signal thinking BEFORE the fetch — on large CPU models, the fetch itself
+  // can block for minutes while Ollama loads/processes. The user needs feedback NOW.
+  if (onThinking) onThinking(true);
+
   let response;
   try {
     response = await fetch(url, {
@@ -144,17 +148,17 @@ async function callOllama(url, model, messages, { onText, onError, onThinking })
       body: JSON.stringify(body),
     });
   } catch (err) {
+    if (onThinking) onThinking(false);
     onError(`Failed to connect to Ollama at ${url}. Is Ollama running?\n${err.message}`);
     return null;
   }
 
   if (!response.ok) {
+    if (onThinking) onThinking(false);
     const text = await response.text();
     onError(`Ollama API error (${response.status}): ${text}`);
     return null;
   }
-
-  if (onThinking) onThinking(true);
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
