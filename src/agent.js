@@ -52,6 +52,17 @@ export function createAgent() {
       const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking, onToken, signal }, () => _cancelled);
       if (!assistantMessage || _cancelled) return;
 
+      // Fallback: if the model wrote tool calls as JSON text instead of using
+      // structured tool_calls, parse them from the text and execute anyway.
+      // This makes qwen-local work with models that don't reliably use the
+      // OpenAI tool calling API format.
+      if ((!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) && assistantMessage.content) {
+        const parsed = parseTextToolCalls(assistantMessage.content);
+        if (parsed.length > 0) {
+          assistantMessage.tool_calls = parsed;
+        }
+      }
+
       messages.push(assistantMessage);
 
       if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
@@ -259,4 +270,57 @@ async function callOllama(url, model, messages, { onText, onError, onThinking, o
   if (toolCallArray.length > 0) assistantMessage.tool_calls = toolCallArray;
 
   return assistantMessage;
+}
+
+// Parse tool calls from the model's text output.
+// Some models (especially smaller ones) output tool calls as JSON code blocks
+// in their text instead of using the structured tool_calls API format.
+// This extracts those and converts them to proper tool call objects.
+const _toolNames = new Set(toolDefinitions.map(t => t.function.name));
+
+function parseTextToolCalls(text) {
+  const calls = [];
+
+  // Match ```json ... ``` blocks containing tool calls
+  const jsonBlockRegex = /```(?:json)?\s*\n?\s*(\{[\s\S]*?\})\s*\n?\s*```/g;
+  let match;
+  while ((match = jsonBlockRegex.exec(text)) !== null) {
+    try {
+      const obj = JSON.parse(match[1]);
+      // Check if it looks like a tool call: { name: "tool_name", arguments: { ... } }
+      if (obj.name && _toolNames.has(obj.name)) {
+        calls.push({
+          id: `text_${Date.now()}_${calls.length}`,
+          type: 'function',
+          function: {
+            name: obj.name,
+            arguments: JSON.stringify(obj.arguments || {})
+          }
+        });
+      }
+    } catch {}
+  }
+
+  // Also try matching bare JSON objects (no code fence) that look like tool calls
+  if (calls.length === 0) {
+    const bareJsonRegex = /\{\s*"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[\s\S]*?\})\s*\}/g;
+    while ((match = bareJsonRegex.exec(text)) !== null) {
+      const name = match[1];
+      if (_toolNames.has(name)) {
+        try {
+          const args = JSON.parse(match[2]);
+          calls.push({
+            id: `text_${Date.now()}_${calls.length}`,
+            type: 'function',
+            function: {
+              name,
+              arguments: JSON.stringify(args)
+            }
+          });
+        } catch {}
+      }
+    }
+  }
+
+  return calls;
 }

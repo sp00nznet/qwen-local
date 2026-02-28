@@ -10,7 +10,7 @@ Current mode: ${mode}
 
 ## Core Rules
 - ALWAYS read a file before editing it. Never guess at file contents.
-- Use the tools provided to interact with the filesystem and run commands.
+- Use the tools provided to interact with the filesystem and run commands. Call tools directly — do NOT write tool calls as JSON in your response text.
 - When the user asks you to do something, use your tools to actually do it — don't just describe what you would do.
 - For destructive operations (deleting files, overwriting important files, force-pushing), confirm with the user first by asking.
 - Prefer editing existing files over creating new ones.
