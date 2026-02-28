@@ -60,10 +60,12 @@ export async function startCLI() {
   });
 
   // Listen for ESC key to interrupt processing.
-  // We don't use Ctrl+C — on Windows it's hardwired to kill the process.
-  // ESC is a clean keypress that readline passes through without side effects.
-  process.stdin.on('keypress', (str, key) => {
-    if (key && key.name === 'escape' && _isBusy) {
+  // We listen for raw bytes on stdin instead of keypress events because readline
+  // buffers ESC (0x1b) waiting for escape sequences (arrow keys etc.) and may
+  // never emit a keypress event for ESC alone.
+  // ESC = single byte 0x1b. Escape sequences are multi-byte (e.g. 0x1b 0x5b 0x41 = arrow up).
+  process.stdin.on('data', (data) => {
+    if (data.length === 1 && data[0] === 0x1b && _isBusy) {
       _aborted = true;
       _isBusy = false;
       _agent.cancel(); // sets flag so callbacks become no-ops
