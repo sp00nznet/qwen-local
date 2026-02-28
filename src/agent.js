@@ -9,6 +9,7 @@ export function createAgent() {
   let initialized = false;
   let totalToolCalls = 0;
   let totalTurns = 0;
+  let currentAbortController = null;
 
   function initSystem() {
     if (!initialized) {
@@ -52,7 +53,9 @@ export function createAgent() {
 
     while (loopCount < maxLoops) {
       loopCount++;
-      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking });
+      currentAbortController = new AbortController();
+      const assistantMessage = await callOllama(ollamaUrl, model, messages, { onText, onError, onThinking }, currentAbortController.signal);
+      currentAbortController = null;
       if (!assistantMessage) return;
 
       messages.push(assistantMessage);
@@ -125,10 +128,17 @@ export function createAgent() {
     };
   }
 
-  return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats };
+  function abort() {
+    if (currentAbortController) {
+      currentAbortController.abort();
+      currentAbortController = null;
+    }
+  }
+
+  return { chat, clearHistory, refreshSystemPrompt, getMessages, setMessages, getStats, abort };
 }
 
-async function callOllama(url, model, messages, { onText, onError, onThinking }) {
+async function callOllama(url, model, messages, { onText, onError, onThinking }, abortSignal) {
   const body = {
     model,
     messages,
@@ -146,9 +156,13 @@ async function callOllama(url, model, messages, { onText, onError, onThinking })
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal: abortSignal,
     });
   } catch (err) {
     if (onThinking) onThinking(false);
+    if (err.name === 'AbortError') {
+      return null; // silently return — user cancelled with Ctrl+C
+    }
     onError(`Failed to connect to Ollama at ${url}. Is Ollama running?\n${err.message}`);
     return null;
   }
@@ -167,62 +181,71 @@ async function callOllama(url, model, messages, { onText, onError, onThinking })
   let toolCalls = {};
   let firstToken = true;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop();
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || !trimmed.startsWith('data: ')) continue;
-      const data = trimmed.slice(6);
-      if (data === '[DONE]') continue;
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const data = trimmed.slice(6);
+        if (data === '[DONE]') continue;
 
-      let chunk;
-      try {
-        chunk = JSON.parse(data);
-      } catch {
-        continue;
-      }
-
-      const choice = chunk.choices?.[0];
-      if (!choice) continue;
-
-      const delta = choice.delta;
-      if (!delta) continue;
-
-      if (delta.content) {
-        if (firstToken && onThinking) {
-          onThinking(false);
-          firstToken = false;
+        let chunk;
+        try {
+          chunk = JSON.parse(data);
+        } catch {
+          continue;
         }
-        contentParts.push(delta.content);
-        onText(delta.content);
-      }
 
-      if (delta.tool_calls) {
-        if (firstToken && onThinking) {
-          onThinking(false);
-          firstToken = false;
-        }
-        for (const tc of delta.tool_calls) {
-          const idx = tc.index ?? 0;
-          if (!toolCalls[idx]) {
-            toolCalls[idx] = {
-              id: tc.id || `call_${idx}_${Date.now()}`,
-              type: 'function',
-              function: { name: '', arguments: '' }
-            };
+        const choice = chunk.choices?.[0];
+        if (!choice) continue;
+
+        const delta = choice.delta;
+        if (!delta) continue;
+
+        if (delta.content) {
+          if (firstToken && onThinking) {
+            onThinking(false);
+            firstToken = false;
           }
-          if (tc.id) toolCalls[idx].id = tc.id;
-          if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
-          if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+          contentParts.push(delta.content);
+          onText(delta.content);
+        }
+
+        if (delta.tool_calls) {
+          if (firstToken && onThinking) {
+            onThinking(false);
+            firstToken = false;
+          }
+          for (const tc of delta.tool_calls) {
+            const idx = tc.index ?? 0;
+            if (!toolCalls[idx]) {
+              toolCalls[idx] = {
+                id: tc.id || `call_${idx}_${Date.now()}`,
+                type: 'function',
+                function: { name: '', arguments: '' }
+              };
+            }
+            if (tc.id) toolCalls[idx].id = tc.id;
+            if (tc.function?.name) toolCalls[idx].function.name += tc.function.name;
+            if (tc.function?.arguments) toolCalls[idx].function.arguments += tc.function.arguments;
+          }
         }
       }
     }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      if (onThinking) onThinking(false);
+      try { reader.cancel(); } catch {}
+      return null;
+    }
+    throw err;
   }
 
   if (onThinking) onThinking(false);

@@ -11,6 +11,9 @@ import { getAllSkills, getSkill, saveSkill, deleteSkill, expandSkillPrompt, matc
 import { loadAllMemory, clearGlobalMemory, clearProjectMemory, getMemoryStats } from './memory.js';
 import { colors, formatToolCall, truncate, contextBar, formatDuration } from './utils.js';
 
+// Module-level flag so SIGINT handler knows if agent is busy
+let _isBusy = false;
+
 export async function startCLI() {
   const cwd = process.cwd();
   setWorkingDirectory(cwd);
@@ -95,13 +98,21 @@ export async function startCLI() {
   };
 
   rl.on('SIGINT', () => {
-    if (multilineBuffer !== null) {
+    if (_isBusy) {
+      // Abort the in-flight request and return to prompt
+      agent.abort();
+      _isBusy = false;
+      console.log(colors.warning('\n\n  Interrupted.\n'));
+      rl.resume();
+      prompt();
+    } else if (multilineBuffer !== null) {
       multilineBuffer = null;
       console.log(colors.dim('\n  (multiline cancelled)'));
+      prompt();
     } else {
       console.log(colors.dim('\n\n  Use /exit to quit.\n'));
+      prompt();
     }
-    prompt();
   });
 
   rl.on('close', () => {
@@ -113,6 +124,7 @@ export async function startCLI() {
 
 async function handleUserInput(input, rl, agent) {
   rl.pause();
+  _isBusy = true;
 
   let spinner = null;
   let thinkingSpinner = null;
@@ -211,6 +223,8 @@ async function handleUserInput(input, rl, agent) {
   if (hasOutput) {
     process.stdout.write('\n');
   }
+
+  _isBusy = false;
 
   const elapsed = Date.now() - startTime;
   const stats = agent.getStats();

@@ -4,6 +4,8 @@
 
 qwen-local is an agentic coding CLI — like having a senior dev pair-programming with you in your terminal. It reads your files, writes code, runs commands, searches your codebase, and plans out complex tasks. All powered by [Qwen3-Coder](https://ollama.com/library/qwen3-coder) running locally through [Ollama](https://ollama.com).
 
+![qwen-local in action](images/qwen-local-demo.png)
+
 ```
   qwen-local
   Agentic coding assistant powered by qwen3-coder-cpu
