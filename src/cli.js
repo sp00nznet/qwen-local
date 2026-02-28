@@ -132,9 +132,9 @@ export async function startCLI() {
   // Without this, Windows sends CTRL_C_EVENT → Node converts to SIGINT → default behavior is exit.
   process.on('SIGINT', () => {});
 
-  rl.on('close', () => {
-    process.exit(0);
-  });
+  // NOTE: We intentionally do NOT use rl.on('close') → process.exit() because on Windows,
+  // SIGINT can trigger readline to close itself, which would kill the process after Ctrl+C.
+  // Instead, /exit calls process.exit() directly.
 
   _promptFn = prompt;
   prompt();
@@ -276,8 +276,7 @@ async function handleCommand(cmd, rl, agent, ask) {
     case '/exit':
     case '/quit':
       console.log(colors.dim('\n  Goodbye!\n'));
-      rl.close();
-      return 'exit';
+      process.exit(0);
 
     case '/clear':
       agent.clearHistory();
