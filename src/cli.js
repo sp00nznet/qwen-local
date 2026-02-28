@@ -75,6 +75,12 @@ export async function startCLI() {
   let multilineBuffer = null;
   let skillDraftState = null; // for interactive skill creation
 
+  // Keepalive: prevent the event loop from draining after AbortController.abort().
+  // Aborting a fetch can leave process.stdin in an unrefed/paused state, causing
+  // Node.js to think there's no more work and exit. This interval guarantees the
+  // process stays alive until we explicitly call process.exit().
+  setInterval(() => {}, 60_000);
+
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -101,9 +107,9 @@ export async function startCLI() {
       if (_abortController) _abortController.abort();
       if (_cancelResolve) { _cancelResolve(); _cancelResolve = null; }
     } else {
-      _dbg('  NOT busy — would exit but NOT exiting (debug mode)');
-      // NOT calling process.exit — just show a message
-      console.log(colors.dim('\n  (Use /exit to quit)\n'));
+      _dbg('  NOT busy — exiting');
+      console.log(colors.dim('\n  Goodbye!\n'));
+      process.exit(0);
     }
   });
 
@@ -126,6 +132,8 @@ export async function startCLI() {
 
   const prompt = () => {
     _dbg('prompt() called — calling rl.question()');
+    // Re-ensure stdin is active after abort (AbortController can leave it unrefed)
+    if (process.stdin.isPaused?.()) process.stdin.resume();
     rl.question(getPromptStr(), async (input) => {
       // Ignore any input that arrives while busy (shouldn't normally happen)
       if (_isBusy) return;
